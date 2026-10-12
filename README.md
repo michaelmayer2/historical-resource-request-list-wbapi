@@ -9,7 +9,7 @@ Requires Python 3.13+ and `git`.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install "posit-sdk @ git+https://github.com/michaelmayer2/posit-sdk-py@workbench"
+pip install -r requirements.txt 
 ```
 
 The `workbench` branch of this fork is required: it provides the API-key client (`posit.workbench.admin`) that the released SDK lacks.
