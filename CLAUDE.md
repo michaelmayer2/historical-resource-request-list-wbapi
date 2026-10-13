@@ -37,3 +37,18 @@ These are non-obvious and drive the structure of `run.py`:
 - **Job `resourceLimits` is empty.** CPU/memory come from the owning session's `launch_parameters.resource_limits`; for active sessions a job links to its session because the session's short `id` appears in the job's `tags`. Active Positron sessions report no limits (Positron doesn't write the session metadata `launch_parameters` comes from), and `get_historical_session` only returns ended sessions, so a running Positron session's request is unknown until it ends. The `unknown_limits_in_hour` column counts these; rerunning a window after its sessions end fills them in.
 - **Status casing differs:** the launcher reports `Running`/`Finished`/`Killed`, audit records `finished`/`failed`; compare lowercased. In practice audit records have `terminatedTime` but an empty `runningTimestamp`, so starts fall back to `submissionTime`.
 - RPC errors from the SDK only expose code and message; to see the inner error, POST to `api/<method>` via `client.post(...)` and print the raw body.
+
+## Server usage via sar (`sar.py`, enabled by `--servers`)
+
+- One `ssh -o BatchMode=yes host sh -s` per host (host key checking disabled: `StrictHostKeyChecking=no`, `UserKnownHostsFile=/dev/null`, `LogLevel=ERROR`) (parallel, `server_slots()` in `run.py`), feeding the `REMOTE` script on stdin: prints `NPROC <n>` then `LC_ALL=C sadf -d <file> -- -u -r -S` for each day file. Failures warn on stderr and drop the host.
+- `sadf -d` is parsed by column name: one `# hostname;interval;timestamp;...` header per activity, UTC timestamps; rows are merged per timestamp, keeping only the all-CPU row (`CPU` = `-1`).
+- Day files are `saDD` (reused monthly) or `saYYYYMMDD`, named by the server's local date, so `day_files()` asks for window days ±1 in both forms and samples are then filtered to the window by timestamp (drops stale files and duplicates).
+- `slot_series()` floors samples to `--sar-interval` (default 10 min) so hosts line up, averages a host's samples within a slot, then sums hosts. Hourly `_avg` / `_peak` are the mean / max over slots.
+- Running scripts with `python -I` breaks `import sar` (script dir is not on `sys.path`); run normally.
+
+## Plotting (`plot.py`)
+
+- Reads run.py's CSV (file or `-`) and writes one self-contained HTML file: Python embeds the rows as JSON, inline JS draws SVG. No plotting dependency is installed in `.venv`; keep it dependency-free.
+- Panels are defined in Python (`REQUESTED_PANELS`, plus `SAR_PANELS` when all `srv_*` columns exist); the JS is generic over them. Ratios are computed in Python; `None` (no sar data via `srv_reporting` = 0, or nothing requested) becomes a gap in the line.
+- `--total-cpus` / `--total-mem-gb`: `relative()` runs after `load()` (so ratios stay absolute), adds `<field>_cap` percentage fields, and swaps them into the CPU / memory panels, keeping the originals in `abs_fields` for the tooltip. A panel's `ref` sets the label of its 100% line.
+- Colors follow the dataviz skill's reference palette (avg = slot 1 blue, peak = slot 2 orange, validated light + dark); CPU and memory are separate panels (never a dual axis). Check layout by screenshotting with headless Chrome (`/Applications/Google Chrome.app`).

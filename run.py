@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Hourly concurrent Workbench sessions between START and END.
-Usage: python run.py [--server URL] [--api-key KEY] 2026-09-01T00:00:00Z 2026-09-08T00:00:00Z
+Usage: python run.py [--server URL] [--api-key KEY] [--servers h1,h2] 2026-09-01T00:00:00Z 2026-09-08T00:00:00Z
 
 Server and API key default to the WORKBENCH_SERVER / WORKBENCH_API_KEY environment
 variables. Prefer the env var for the key so it doesn't end up in shell history.
+With --servers, measured usage from each server's sysstat history (via ssh) is added.
 """
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from posit.workbench.admin import Client, WorkbenchError
+
+import sar
 
 
 def parse_ts(v):
@@ -63,7 +67,22 @@ def job_interval(job, now):
     return s, e or now
 
 
-def main(start, end, server=None, api_key=None, users=None):
+def server_slots(hosts, start, end, interval, ssh_user=None, sa_dir=None):
+    """Fetch sysstat history from all hosts in parallel; warn about and skip failures."""
+    def one(host):
+        try:
+            return host, sar.fetch(host, start, end, ssh_user=ssh_user, sa_dir=sa_dir)
+        except Exception as e:  # ssh, timeout, missing sysstat: report and carry on
+            print(f"warning: {host}: {e}", file=sys.stderr)
+            return host, None
+
+    with ThreadPoolExecutor(max_workers=min(16, len(hosts))) as pool:
+        per_host = {h: r for h, r in pool.map(one, hosts) if r}
+    return sar.slot_series(per_host, interval)
+
+
+def main(start, end, server=None, api_key=None, users=None,
+         servers=None, ssh_user=None, sa_dir=None, sar_interval=10):
     start, end = parse_ts(start), parse_ts(end)
     now = datetime.now(timezone.utc)
     client = Client(url=server, api_key=api_key)
@@ -125,9 +144,18 @@ def main(start, end, server=None, api_key=None, users=None):
             # exists (i.e. until they end), so track whether the request is known.
             intervals.append((s, e, *requested(rl), bool(rl)))
 
-    print("hour_utc,running_at_hour,overlapping_in_hour,cpu_at_hour,mem_mb_at_hour,"
-          "cpu_avg,cpu_peak,mem_mb_avg,mem_mb_peak,unknown_limits_in_hour")
-    t = start.replace(minute=0, second=0, microsecond=0)
+    first = start.replace(minute=0, second=0, microsecond=0)
+    slots = None
+    if servers:
+        last = end.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        slots = server_slots(servers, first, last, timedelta(minutes=sar_interval),
+                             ssh_user=ssh_user, sa_dir=sa_dir)
+
+    cols = ["hour_utc", "running_at_hour", "overlapping_in_hour", "cpu_at_hour",
+            "mem_mb_at_hour", "cpu_avg", "cpu_peak", "mem_mb_avg", "mem_mb_peak",
+            "unknown_limits_in_hour"]
+    print(",".join(cols + (sar.header() if slots is not None else [])))
+    t = first
     while t <= end:
         t_next = t + timedelta(hours=1)
         at = [i for i in intervals if i[0] <= t < i[1]]
@@ -147,10 +175,13 @@ def main(start, end, server=None, api_key=None, users=None):
             cpu_peak = max(cpu_peak, sum(i[2] for i in live))
             mem_peak = max(mem_peak, sum(i[3] for i in live))
 
-        print(f"{t:%Y-%m-%dT%H:00Z},{len(at)},{len(hour)},"
-              f"{sum(i[2] for i in at):g},{sum(i[3] for i in at):g},"
-              f"{cpu_avg:.2f},{cpu_peak:g},{mem_avg:.0f},{mem_peak:g},"
-              f"{sum(1 for i in hour if not i[4])}")
+        row = [f"{t:%Y-%m-%dT%H:00Z}", len(at), len(hour),
+               f"{sum(i[2] for i in at):g}", f"{sum(i[3] for i in at):g}",
+               f"{cpu_avg:.2f}", f"{cpu_peak:g}", f"{mem_avg:.0f}", f"{mem_peak:g}",
+               sum(1 for i in hour if not i[4])]
+        if slots is not None:
+            row += sar.hour_columns(slots, t, t_next)
+        print(",".join(map(str, row)))
         t = t_next
 
 
@@ -162,5 +193,13 @@ if __name__ == "__main__":
     ap.add_argument("--api-key", help="Workbench API key (default: $WORKBENCH_API_KEY)")
     ap.add_argument("--user", action="append", dest="users",
                     help="only query this user (repeatable; default: all users)")
+    ap.add_argument("--servers", type=lambda s: [h.strip() for h in s.split(",") if h.strip()],
+                    help="comma-separated hosts to read sysstat (sar) history from via ssh")
+    ap.add_argument("--ssh-user", help="ssh login user (default: from ssh config)")
+    ap.add_argument("--sa-dir", help="sysstat data dir (default: /var/log/sa or /var/log/sysstat)")
+    ap.add_argument("--sar-interval", type=int, default=10,
+                    help="minutes per slot for aligning servers' samples (default: 10)")
     args = ap.parse_args()
-    main(args.start, args.end, server=args.server, api_key=args.api_key, users=args.users)
+    main(args.start, args.end, server=args.server, api_key=args.api_key, users=args.users,
+         servers=args.servers, ssh_user=args.ssh_user, sa_dir=args.sa_dir,
+         sar_interval=args.sar_interval)
